@@ -9,384 +9,452 @@ from datetime import datetime
 # --- Constants and Configuration ---
 DATA_PATH = 'books .csv' # Updated CSV filename with space
 DEFAULT_MIN_VOTES_THRESHOLD = 50
-DEFAULT_MIN_RATING_THRESHOLD = 3.5
+DEFAULT_MIN_RATING_THRESHOLD = 3.5 # Slightly lowered for broader initial results
 DEFAULT_LIKED_PERCENT_THRESHOLD = 75
 DEFAULT_WEIGHTED_SCORE_ANCHOR_VOTES = 100
 DEFAULT_VOTES_POWER = 1.0
 
+# Column name mapping from new CSV to internal consistent names
 COLUMN_NAME_MAP = {
-    'bookId': 'book_id_str', 'author': 'authors', 'rating': 'average_rating',
-    'numRatings': 'ratings_count', 'pages': 'num_pages', 'language': 'language_code',
-    'publishDate': 'publication_date_edition', 'firstPublishDate': 'first_publication_date',
+    'bookId': 'book_id_str',
+    'author': 'authors',
+    'rating': 'average_rating',
+    'numRatings': 'ratings_count',
+    'pages': 'num_pages',
+    'language': 'language_code',
+    'publishDate': 'publication_date_edition', # Specific edition's publication
+    'firstPublishDate': 'first_publication_date', # Original work's publication
+    # Columns to keep as is: title, series, publisher, genres, bookFormat, likedPercent, coverImg, price
 }
+
+# Define required original columns from the CSV
+# These are needed for the app to function with the new dataset
 REQUIRED_ORIGINAL_COLS = [
     'title', 'author', 'rating', 'numRatings', 'pages', 'language',
-    'publisher', 'genres', 'coverImg'
+    'publisher', 'genres', 'coverImg' # 'publishDate' or 'firstPublishDate' also important for sorting
 ]
+
 
 @st.cache_data
 def load_and_clean_data(file_path):
     try:
+        # Use index_col=0 if the first column in CSV is just an unnamed index
         df = pd.read_csv(file_path, index_col=0, on_bad_lines='skip')
         df.columns = df.columns.str.strip().str.replace('\ufeff', '', regex=False)
+
+        # Check for required original columns before renaming
         for col in REQUIRED_ORIGINAL_COLS:
             if col not in df.columns:
-                st.error(f"Error: Essential source column '{col}' not found.")
+                st.error(f"Error: Essential source column '{col}' not found in the CSV. Please check the dataset structure.")
                 return pd.DataFrame()
+
+        # Rename columns for consistency with previous logic where applicable
         df.rename(columns=COLUMN_NAME_MAP, inplace=True)
 
+        # --- Data Type Conversions and Cleaning ---
+        # Numeric columns
         df['ratings_count'] = pd.to_numeric(df.get('ratings_count'), errors='coerce').fillna(0).astype(int)
         df['num_pages'] = pd.to_numeric(df.get('num_pages'), errors='coerce').fillna(0).astype(int)
-        df['average_rating'] = pd.to_numeric(df.get('average_rating'), errors='coerce')
+        df['average_rating'] = pd.to_numeric(df.get('average_rating'), errors='coerce') # Keep as float
         df['likedPercent'] = pd.to_numeric(df.get('likedPercent'), errors='coerce').fillna(0)
-        df['price'] = pd.to_numeric(df.get('price'), errors='coerce').fillna(0)
+        df['price'] = pd.to_numeric(df.get('price'), errors='coerce').fillna(0) # Assuming price is numeric
 
+        # String columns
         for col in ['title', 'authors', 'publisher', 'series', 'bookFormat', 'language_code', 'book_id_str']:
             df[col] = df.get(col, pd.Series(index=df.index, dtype='str')).fillna('Unknown')
+        
         df['coverImg'] = df.get('coverImg', pd.Series(index=df.index, dtype='str')).fillna('')
 
+        # Date columns - attempt to parse both, prioritize first_publication_date
         df['first_publication_date_dt'] = pd.to_datetime(df.get('first_publication_date'), errors='coerce', format='%m/%d/%y', infer_datetime_format=False)
         df['publication_date_edition_dt'] = pd.to_datetime(df.get('publication_date_edition'), errors='coerce', format='%m/%d/%y', infer_datetime_format=False)
-        df['publication_year'] = df['first_publication_date_dt'].dt.year.fillna(df['publication_date_edition_dt'].dt.year).fillna(0).astype(int)
-        df['display_publication_date'] = df['first_publication_date_dt'].dt.strftime('%Y-%m-%d').fillna(df['publication_date_edition_dt'].dt.strftime('%Y-%m-%d')).fillna('Unknown')
 
+        # Create a single 'publication_year' column for filtering, prioritizing first publication
+        df['publication_year'] = df['first_publication_date_dt'].dt.year.fillna(df['publication_date_edition_dt'].dt.year).fillna(0).astype(int)
+        
+        # For display, keep original date strings if needed, or format from datetime
+        df['display_publication_date'] = df['first_publication_date_dt'].dt.strftime('%Y-%m-%d').fillna(
+                                           df['publication_date_edition_dt'].dt.strftime('%Y-%m-%d')).fillna('Unknown')
+
+
+        # Genre parsing (string representation of list)
         def parse_genres(genre_str):
             if isinstance(genre_str, str) and genre_str.startswith('[') and genre_str.endswith(']'):
-                try: return ast.literal_eval(genre_str)
-                except: return []
-            return [] if not isinstance(genre_str, list) else genre_str
+                try:
+                    return ast.literal_eval(genre_str)
+                except (ValueError, SyntaxError):
+                    return [] # Or handle malformed strings appropriately
+            elif isinstance(genre_str, list): # Already a list
+                return genre_str
+            return []
         df['genres_list'] = df['genres'].apply(parse_genres)
-        df['genres_display'] = df['genres_list'].apply(lambda x: ', '.join(x[:3]) + ('...' if len(x) > 3 else '') if x else 'N/A') # Show top 3 genres
+        df['genres_display'] = df['genres_list'].apply(lambda x: ', '.join(x) if x else 'N/A')
+
 
         return df
+
     except FileNotFoundError:
-        st.error(f"Error: The file '{file_path}' was not found.")
+        st.error(f"Error: The file '{file_path}' was not found. Please ensure it's in the correct directory.")
         return pd.DataFrame()
     except Exception as e:
-        st.error(f"An critical error occurred during data loading: {e}")
+        st.error(f"An critical error occurred during data loading and cleaning: {e}")
         return pd.DataFrame()
 
 # --- Page Setup and Styling ---
-st.set_page_config(layout="wide", page_title="📚 Advanced Book Portal 📖")
+st.set_page_config(layout="wide", page_title="✨ Wizard Book Explorer ✨")
 
 st.markdown("""
 <style>
     body {
-        color: #EAEAEA; background-color: #121212; /* Darker background, lighter text */
-        font-family: 'Roboto', 'Segoe UI', sans-serif;
+        color: #E0E0E0; /* Lighter text for dark mode feel */
+        background-color: #1E1E1E; /* Dark background */
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
     }
-    /* Dataframe image styling */
-    .stDataFrame img {
-        max-height: 120px; /* Increased from 80px for table view */
-        width: auto; object-fit: contain; display: block; margin: auto;
-        border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.5);
+    .stDataFrame { /* Target Streamlit dataframe */
+        background-color: #2A2A2A;
+    }
+    .stDataFrame img { /* Ensure images in dataframe cells are not too large */
+        max-height: 80px;
+        object-fit: contain;
     }
     .st-emotion-cache-1cypcdb { /* Sidebar */
-        background-color: #1E1E1E; border-right: 1px solid #333; padding: 20px;
+        background-color: #2A2A2A; /* Darker sidebar */
+        padding: 20px;
+        border-right: 1px solid #444;
     }
-    .st-emotion-cache-1jm9le { padding: 25px; } /* Main content area */
-
-    h1, h2, h3, h4, h5, h6 { color: #BB86FC; } /* Primary accent for headers (Material Design Dark Purple) */
-    h1 { color: #03DAC6; } /* Secondary accent for main title (Material Design Dark Teal) */
-    hr { border-top: 1px solid #333; }
-
-    /* Input widgets more integrated with dark theme */
-    .stTextInput input, .stSlider div[data-baseweb="slider"], .stMultiSelect div[data-baseweb="select"] > div, .stSelectbox div[data-baseweb="select"] > div {
-        border-radius: 6px; border: 1px solid #444; background-color: #2C2C2C; color: #EAEAEA;
+    .st-emotion-cache-1jm9le { /* Main content area */
+        padding: 25px;
     }
-    .stMultiSelect div[data-baseweb="select"] > div, .stSelectbox div[data-baseweb="select"] > div { padding: 6px; }
-    .stSlider span[role="slider"] { background-color: #BB86FC !important; }
-    .stRadio div[data-baseweb="radio"] { background-color: #2C2C2C; padding:8px; border-radius:6px;}
-
-
-    .stButton>button {
-        border: 1px solid #03DAC6; background-color: transparent; color: #03DAC6;
-        padding: 8px 16px; border-radius: 6px; font-weight: bold;
-        transition: all 0.2s ease-in-out;
+    h1, h2, h3, h4, h5, h6 {
+        color: #00A0B0; /* Teal accent for headers */
+        margin-bottom: 0.5em;
     }
-    .stButton>button:hover { background-color: #03DAC6; color: #121212; transform: translateY(-2px); }
-    .stButton>button:active { transform: translateY(0px); }
+    h1 { color: #FF6B6B; } /* Main title a bit different */
+
+    hr { border-top: 1px solid #444; }
+
+    /* Input widgets */
+    .stTextInput input, .stSlider div[data-baseweb="slider"], .stMultiSelect div[data-baseweb="select"] > div {
+        border-radius: 5px;
+        border: 1px solid #555;
+        background-color: #333;
+        color: #E0E0E0;
+    }
+    .stMultiSelect div[data-baseweb="select"] > div { padding: 5px; }
+    .stSlider span[role="slider"] { background-color: #00A0B0 !important; }
+
+
+    /* Expander styling */
+    .st-emotion-cache-1h9usn1 p { /* Expander header text */
+        color: #00A0B0;
+        font-weight: bold;
+    }
     
-    a { color: #81D4FA; } a:hover { color: #B3E5FC; }
-
-    /* Card Styling for Grid/Card Views */
-    .book-grid-container { display: flex; flex-wrap: wrap; gap: 20px; }
-    .book-card {
-        background-color: #1E1E1E; border: 1px solid #333; border-radius: 8px;
-        padding: 15px; margin-bottom:0px; /* margin handled by gap */
-        display: flex; flex-direction: column;
-        height: 100%; /* Critical for consistent height in columns */
-        box-shadow: 0 4px 8px rgba(0,0,0,0.3);
-        transition: transform 0.2s ease-out, box-shadow 0.2s ease-out;
+    .stButton>button { /* Button styling */
+        border: 2px solid #00A0B0;
+        background-color: transparent;
+        color: #00A0B0;
+        padding: 8px 16px;
+        border-radius: 5px;
+        transition: all 0.3s ease;
     }
-    .book-card:hover { transform: translateY(-5px); box-shadow: 0 8px 16px rgba(0,0,0,0.5); }
-    .book-card-image-container { text-align: center; margin-bottom: 12px; }
-    .book-card img {
-        max-width: 100%; width: auto; max-height: 200px; /* Good size for cards */
-        object-fit: contain; border-radius: 4px;
+    .stButton>button:hover {
+        background-color: #00A0B0;
+        color: #1E1E1E;
     }
-    .card-title { font-size: 1.1em; font-weight: bold; color: #03DAC6; margin-bottom: 4px; line-height: 1.3; }
-    .card-author { font-size: 0.9em; color: #B0B0B0; margin-bottom: 8px; }
-    .card-info { font-size: 0.85em; color: #AAAAAA; margin-bottom: 3px; }
-    .card-info strong { color: #CFCECE; }
-    .card-actions { margin-top: auto; padding-top:10px; /* Pushes actions to bottom */ }
+    .st-emotion-cache-zq5wz9, .st-emotion-cache-10y5m8g {
+         margin-bottom: 0.5rem; padding-bottom: 0.5rem;
+    }
+    a { color: #66D9EF; text-decoration: none; } /* Links */
+    a:hover { text-decoration: underline; color: #A6E22E; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📚 Advanced Book Portal 📖")
+st.title("✨ Wizard Book Explorer ✨")
+st.write("""
+Dive into a magical realm of books! Filter by genre, publication year, ratings, and more.
+Discover your next great read with powerful sorting options and cover previews.
+""")
 
 df_original = load_and_clean_data(DATA_PATH)
-if df_original.empty: st.stop()
+
+if df_original.empty:
+    st.warning("The Book Tome is empty or could not be summoned. Please check the data source and error messages.")
+    st.stop()
+
 df = df_original.copy()
+
+# Calculate Overall Average Rating (C)
 C = df['average_rating'].mean() if pd.notna(df['average_rating'].mean()) else 0.0
 
 # --- Sidebar ---
 st.sidebar.header("📜 Filters & Scrolls 📜")
-# --- Display Mode Selector ---
-display_mode = st.sidebar.radio(
-    "🖼️ Display Mode",
-    ["Enhanced Table", "Image Grid", "Card View (Details on Click)"],
-    index=1, # Default to Image Grid
-    key="display_mode_selector",
-    help="Choose how to view the book listings."
-)
 st.sidebar.markdown("---")
 
+# --- Search and Sort (Top of Sidebar) ---
 search_query = st.sidebar.text_input("🔍 Search Titles, Authors, Publishers", help="Case-insensitive search.").lower()
 st.sidebar.markdown("---")
 
 st.sidebar.subheader("🪄 Sort Your Findings")
 sort_options_map = {
     'Custom Score (Rating * Votes^p) [Recommended]': 'rating_votes_power_score',
-    'Weighted Score (IMDb Style)': 'weighted_score', 'Average Rating (High to Low)': 'average_rating',
-    'Ratings Count (High to Low)': 'ratings_count', 'Liked Percentage (High to Low)': 'likedPercent',
-    'Publication Year (Newest First)': 'pub_year_newest', 'Publication Year (Oldest First)': 'pub_year_oldest',
-    'Page Count (Shortest First)': 'num_pages_asc', 'Page Count (Longest First)': 'num_pages_desc',
-    'Price (Low to High)': 'price_asc', 'Price (High to Low)': 'price_desc',
+    'Weighted Score (IMDb Style)': 'weighted_score',
+    'Average Rating (High to Low)': 'average_rating',
+    'Ratings Count (High to Low)': 'ratings_count',
+    'Liked Percentage (High to Low)': 'likedPercent',
+    'Publication Year (Newest First)': 'pub_year_newest',
+    'Publication Year (Oldest First)': 'pub_year_oldest',
+    'Page Count (Shortest First)': 'num_pages_asc',
+    'Page Count (Longest First)': 'num_pages_desc',
+    'Price (Low to High)': 'price_asc',
+    'Price (High to Low)': 'price_desc',
 }
 default_sort_key = 'Custom Score (Rating * Votes^p) [Recommended]'
 sort_by_display_name = st.sidebar.selectbox(
-    "Sort by", options=list(sort_options_map.keys()),
+    "Sort by",
+    options=list(sort_options_map.keys()),
     index=list(sort_options_map.keys()).index(default_sort_key)
 )
 selected_sort_method = sort_options_map[sort_by_display_name]
 
-with st.sidebar.expander("🔧 Sorting Parameters", expanded=False):
-    p = st.slider("Votes Power ('p') for Custom Score", 0.0, 2.0, DEFAULT_VOTES_POWER, 0.05)
-    m_val = st.slider("Anchor Votes ('m') for Weighted Score", 0, 1000, DEFAULT_WEIGHTED_SCORE_ANCHOR_VOTES, 10)
+with st.sidebar.expander("🔧 Sorting Parameters (Advanced)", expanded=False):
+    st.markdown("Adjust parameters for specific sorting methods.")
+    st.subheader("Parameter 'p' for Custom Score")
+    p = st.slider(
+        "Votes Power ('p')", 0.0, 2.0, DEFAULT_VOTES_POWER, 0.05,
+        help="Rating * Votes^p. p=0: score=rating. p=1: score=rating*votes."
+    )
+    st.subheader("Parameter 'm' for Weighted Score")
+    st.write(f"Overall Avg Rating (C) ≈ {C:.2f}")
+    m_val = st.slider(
+        "Weighted Score Anchor Votes ('m')", 0, 1000, DEFAULT_WEIGHTED_SCORE_ANCHOR_VOTES, 10,
+        help="'m' virtual ratings at value C. Higher 'm' pulls scores to C."
+    )
 
 st.sidebar.markdown("---")
-with st.sidebar.expander("🌟 Quality & Engagement", expanded=True):
-    min_votes_threshold = st.slider("Min Ratings Count", 0, int(df['ratings_count'].max() if not df.empty else 1000), DEFAULT_MIN_VOTES_THRESHOLD, 10)
-    min_rating_threshold = st.slider("Min Average Rating", 0.0, 5.0, DEFAULT_MIN_RATING_THRESHOLD, 0.1)
-    min_liked_percent = st.slider("Min Liked Percent", 0, 100, DEFAULT_LIKED_PERCENT_THRESHOLD, 1)
+
+# --- Filter Groups ---
+with st.sidebar.expander("🌟 Primary Quality & Engagement", expanded=True):
+    min_votes_threshold = st.slider(
+        "Minimum Ratings Count", 0, int(df['ratings_count'].max() if not df.empty else 1000),
+        DEFAULT_MIN_VOTES_THRESHOLD, 10
+    )
+    min_rating_threshold = st.slider(
+        "Minimum Average Rating", 0.0, 5.0, DEFAULT_MIN_RATING_THRESHOLD, 0.1
+    )
+    min_liked_percent = st.slider(
+        "Minimum Liked Percent", 0, 100, DEFAULT_LIKED_PERCENT_THRESHOLD, 1,
+        help="Minimum percentage of readers who liked the book."
+    )
 
 with st.sidebar.expander("📚 Content Attributes"):
+    # Genre Filter
     all_genres_flat = sorted(list(set(g for sublist in df['genres_list'] for g in sublist if g)))
-    selected_genres = st.multiselect("Filter by Genres (ANY selected)", options=all_genres_flat, default=[])
-    
+    selected_genres = st.multiselect(
+        "Filter by Genres (ANY selected)",
+        options=all_genres_flat,
+        default=[],
+        help="Show books that have ANY of the selected genres."
+    )
+    # Language Filter
     unique_languages = sorted(df['language_code'].dropna().unique().tolist())
-    if unique_languages and not (len(unique_languages) == 1 and unique_languages[0] == 'Unknown'):
+    # Remove 'Unknown' if it's the only one or provide 'All'
+    if 'Unknown' in unique_languages and len(unique_languages) == 1 and not all_genres_flat : # if unknown is only lang and no genres selected
+        pass # Don't show language filter if not diverse
+    elif unique_languages:
         all_languages_option = ['All'] + [lang for lang in unique_languages if lang != 'Unknown']
-        selected_languages_multiselect = st.multiselect("Language", options=all_languages_option, default=['All'])
+        selected_languages_multiselect = st.multiselect(
+            "Language", options=all_languages_option, default=['All']
+        )
 
+    # Book Format Filter
     unique_formats = sorted(df['bookFormat'].dropna().unique().tolist())
-    if unique_formats and not (len(unique_formats) == 1 and unique_formats[0] == 'Unknown'):
-         selected_formats = st.multiselect("Book Format", options=[fmt for fmt in unique_formats if fmt != 'Unknown'], default=[])
+    if unique_formats:
+         selected_formats = st.multiselect(
+            "Book Format", options=[fmt for fmt in unique_formats if fmt != 'Unknown'], default=[]
+        )
+
 
 with st.sidebar.expander("📖 Publication & Length"):
     min_year = int(df['publication_year'][df['publication_year'] > 0].min() if not df[df['publication_year'] > 0].empty else 1800)
     max_year = int(df['publication_year'].max() if not df.empty else datetime.now().year)
-    if min_year < max_year : # ensure valid range
-      selected_year_range = st.slider("Publication Year Range", min_year, max_year, (min_year, max_year))
-    else: # Fallback if data is sparse for years
-      st.info("Publication year data not sufficient for range filter.")
-      selected_year_range = (min_year, max_year) # still assign for downstream logic
-
+    selected_year_range = st.slider(
+        "Publication Year Range (First Pub.)",
+        min_year, max_year, (min_year, max_year)
+    )
     max_pg = int(df['num_pages'].max() if not df.empty else 1000)
-    min_pg_sel, max_pg_selected = st.slider("Page Count Range", 0, max_pg, (0, max_pg), 10)
+    min_pg, max_pg_selected = st.slider(
+        "Page Count Range", 0, max_pg, (0, max_pg), 10
+    )
 
-if 'price' in df.columns and df['price'].nunique() > 1 and df['price'].sum() > 0:
-    with st.sidebar.expander("💰 Price"):
-        min_price = float(df['price'][df['price'] > 0].min(skipna=True) if not df[df['price'] > 0].empty else 0)
-        max_price = float(df['price'].max(skipna=True) if not df.empty else 100)
-        if max_price <= min_price: max_price = min_price + 10 if min_price > 0 else 100
-        selected_price_range = st.slider("Price Range", min_price, max_price, (min_price, max_price), max(0.1, (max_price-min_price)/100))
+if 'price' in df.columns and df['price'].nunique() > 1 : # only show if price data is meaningful
+    with st.sidebar.expander("💰 Price (if available)"):
+        min_price = float(df['price'][df['price'] > 0].min() if not df[df['price'] > 0].empty else 0)
+        max_price = float(df['price'].max() if not df.empty else 100)
+        # Ensure min_price is less than max_price for slider
+        if min_price >= max_price and max_price > 0: max_price = min_price + 1 # simple adjustment
+        elif min_price >=max_price and max_price == 0 : max_price = 100 # default if no price data
+
+        if max_price > min_price: # Only show slider if range is valid
+            selected_price_range = st.slider(
+                "Price Range",
+                min_price, max_price, (min_price, max_price), step=max(0.1, (max_price-min_price)/100) # Dynamic step
+            )
+        else:
+            st.info("Price data not sufficient for range filter.")
 
 
-# --- Score Calculations (Simplified for brevity, full logic from previous step assumed) ---
-df['weighted_score'] = ((df['ratings_count'] / (df['ratings_count'] + m_val)) * df['average_rating'] + (m_val / (df['ratings_count'] + m_val)) * C) if m_val > 0 else df['average_rating']
-df.loc[df['average_rating'].isna(), 'weighted_score'] = np.nan
+# --- Score Calculations ---
+df['weighted_score'] = np.nan
+valid_ratings_mask_ws = df['average_rating'].notna()
+if m_val == 0:
+    df.loc[valid_ratings_mask_ws, 'weighted_score'] = df.loc[valid_ratings_mask_ws, 'average_rating']
+else:
+    df.loc[valid_ratings_mask_ws, 'weighted_score'] = (
+        (df.loc[valid_ratings_mask_ws, 'ratings_count'] / (df.loc[valid_ratings_mask_ws, 'ratings_count'] + m_val)) * df.loc[valid_ratings_mask_ws, 'average_rating'] +
+        (m_val / (df.loc[valid_ratings_mask_ws, 'ratings_count'] + m_val)) * C
+    )
 
-df['rating_votes_power_score'] = (df['average_rating'] * (df['ratings_count'] ** p)) if p > 0 else df['average_rating']
-df.loc[df['average_rating'].isna() | ((df['ratings_count'] == 0) & (p > 0)), 'rating_votes_power_score'] = 0
+df['rating_votes_power_score'] = 0.0
+valid_ratings_mask_rp = df['average_rating'].notna()
+if p == 0:
+    df.loc[valid_ratings_mask_rp, 'rating_votes_power_score'] = df.loc[valid_ratings_mask_rp, 'average_rating'].fillna(0)
+else:
+    has_rating_pos_votes = valid_ratings_mask_rp & (df['ratings_count'] > 0)
+    df.loc[has_rating_pos_votes, 'rating_votes_power_score'] = (
+        df.loc[has_rating_pos_votes, 'average_rating'] *
+        (df.loc[has_rating_pos_votes, 'ratings_count'] ** p)
+    )
 df['rating_votes_power_score'] = df['rating_votes_power_score'].fillna(0)
 
 
-# --- Apply Filters (Simplified for brevity, full logic from previous step assumed) ---
+# --- Apply Filters ---
 current_mask = pd.Series([True] * len(df), index=df.index)
+
 if search_query:
-    search_cols = ['title', 'authors', 'publisher', 'series']
+    search_cols = ['title', 'authors', 'publisher', 'series'] # Include series in search
     current_mask &= df[search_cols].apply(lambda row: row.astype(str).str.lower().str.contains(search_query, regex=False).any(), axis=1)
-current_mask &= (df['ratings_count'] >= min_votes_threshold) & \
-                (df['average_rating'].fillna(0) >= min_rating_threshold) & \
-                (df['likedPercent'].fillna(0) >= min_liked_percent)
-if selected_genres: current_mask &= df['genres_list'].apply(lambda x_genres: any(sg in x_genres for sg in selected_genres))
+
+current_mask &= (df['ratings_count'] >= min_votes_threshold)
+current_mask &= (df['average_rating'].fillna(0) >= min_rating_threshold) # handle NaN ratings for filter
+current_mask &= (df['likedPercent'].fillna(0) >= min_liked_percent)
+
+if selected_genres:
+    current_mask &= df['genres_list'].apply(lambda x_genres: any(sg in x_genres for sg in selected_genres))
+
 if 'selected_languages_multiselect' in locals() and 'All' not in selected_languages_multiselect and selected_languages_multiselect:
     current_mask &= df['language_code'].isin(selected_languages_multiselect)
-if 'selected_formats' in locals() and selected_formats: current_mask &= df['bookFormat'].isin(selected_formats)
-if 'selected_year_range' in locals(): current_mask &= (df['publication_year'] >= selected_year_range[0]) & (df['publication_year'] <= selected_year_range[1])
-current_mask &= (df['num_pages'] >= min_pg_sel) & (df['num_pages'] <= max_pg_selected)
-if 'selected_price_range' in locals() and 'price' in df.columns: current_mask &= (df['price'] >= selected_price_range[0]) & (df['price'] <= selected_price_range[1])
+
+if 'selected_formats' in locals() and selected_formats:
+    current_mask &= df['bookFormat'].isin(selected_formats)
+
+current_mask &= (df['publication_year'] >= selected_year_range[0]) & (df['publication_year'] <= selected_year_range[1])
+current_mask &= (df['num_pages'] >= min_pg) & (df['num_pages'] <= max_pg_selected)
+
+if 'selected_price_range' in locals() and 'price' in df.columns:
+     current_mask &= (df['price'] >= selected_price_range[0]) & (df['price'] <= selected_price_range[1])
+
+
 filtered_df = df[current_mask].copy()
 
-# --- Apply Sorting (Simplified for brevity, full logic from previous step assumed) ---
-# ... (Full sorting logic as in previous version should be here) ...
-# For this example, just a basic sort to ensure 'sorted_df' exists
+# --- Apply Sorting ---
+sorted_df = pd.DataFrame(columns=filtered_df.columns) # Init empty
 if not filtered_df.empty:
-    # Simplified sorting - replace with full logic from previous answer
-    sort_col = selected_sort_method
-    ascending_order = True
+    sort_ascending = True
+    na_pos = 'first'
+    
     if selected_sort_method in ['rating_votes_power_score', 'weighted_score', 'average_rating', 'ratings_count', 'likedPercent', 'pub_year_newest', 'num_pages_desc', 'price_desc']:
-        ascending_order = False
+        sort_ascending = False
+        na_pos = 'last'
 
-    if selected_sort_method == 'pub_year_newest': sort_col = 'publication_year'
-    elif selected_sort_method == 'pub_year_oldest': sort_col = 'publication_year'
-    elif selected_sort_method == 'num_pages_asc': sort_col = 'num_pages'
-    elif selected_sort_method == 'num_pages_desc': sort_col = 'num_pages'
-    elif selected_sort_method == 'price_asc': sort_col = 'price'
-    elif selected_sort_method == 'price_desc': sort_col = 'price'
-        
-    sorted_df = filtered_df.sort_values(by=sort_col, ascending=ascending_order, na_position='last' if ascending_order else 'first')
-else:
-    sorted_df = filtered_df # empty dataframe
+    if selected_sort_method == 'pub_year_newest':
+        sorted_df = filtered_df.sort_values(by='publication_year', ascending=False, na_position='last')
+    elif selected_sort_method == 'pub_year_oldest':
+        sorted_df = filtered_df.sort_values(by='publication_year', ascending=True, na_position='first')
+    elif selected_sort_method == 'price_asc':
+         sorted_df = filtered_df.sort_values(by='price', ascending=True, na_position='first')
+    elif selected_sort_method == 'price_desc':
+         sorted_df = filtered_df.sort_values(by='price', ascending=False, na_position='last')
+    elif selected_sort_method in ['num_pages_asc', 'num_pages_desc']:
+        col_to_sort = 'num_pages'
+        sorted_df = filtered_df.sort_values(by=col_to_sort, ascending=sort_ascending, na_position=na_pos)
+    elif selected_sort_method in sort_options_map.values():
+        # Handles 'rating_votes_power_score', 'weighted_score', 'average_rating', 'ratings_count', 'likedPercent'
+        sorted_df = filtered_df.sort_values(by=selected_sort_method, ascending=sort_ascending, na_position=na_pos)
+    else:
+        sorted_df = filtered_df # Fallback
+
+
+# --- Audible Link ---
+def create_audible_link_url(title_str):
+    if pd.isna(title_str) or title_str == '' or title_str == 'Unknown':
+        return None
+    base = "https://www.audible.in/search?"
+    params = {'keywords': str(title_str), 'k': str(title_str)}
+    return f"{base}{urllib.parse.urlencode(params)}"
 
 if not sorted_df.empty and 'title' in sorted_df.columns:
-    sorted_df['Audible Link URL'] = sorted_df['title'].apply(lambda t: f"https://www.audible.in/search?keywords={urllib.parse.quote_plus(str(t))}" if pd.notna(t) and t != 'Unknown' else None)
-elif 'Audible Link URL' not in sorted_df.columns:
+    sorted_df['Audible Link URL'] = sorted_df['title'].apply(create_audible_link_url)
+elif 'Audible Link URL' not in sorted_df.columns : # Ensure column exists for empty df
      sorted_df['Audible Link URL'] = pd.Series(dtype='str')
 
-# --- Star Rating Function ---
-def get_star_rating(rating_val):
-    if pd.isna(rating_val): return "N/A"
-    try:
-        rating_val = float(rating_val)
-        full_stars = int(rating_val)
-        half_star = "½" if rating_val - full_stars >= 0.5 else ""
-        empty_stars = 5 - full_stars - (1 if half_star else 0)
-        return f"{'★' * full_stars}{half_star}{'☆' * empty_stars} ({rating_val:.2f})"
-    except: return "N/A"
+
+# --- Display Results ---
+st.subheader(f"✨ Found {len(sorted_df)} / {len(df_original)} Books ✨")
+
+display_cols = [
+    'coverImg', 'title', 'authors', 'series', 'average_rating', 'ratings_count', 'likedPercent',
+    'genres_display', 'bookFormat', 'num_pages', 'display_publication_date', 'publisher'
+]
+if 'price' in sorted_df.columns and sorted_df['price'].sum() > 0: # show price if data exists
+    display_cols.append('price')
 
 
-# --- Display Functions for Each Mode ---
-def display_enhanced_table(df_to_display):
-    st.markdown("##### Enhanced Table View")
-    display_cols_table = ['coverImg', 'title', 'authors', 'series', 'average_rating', 'ratings_count', 'likedPercent', 'genres_display', 'bookFormat', 'num_pages', 'display_publication_date', 'Audible Link URL']
-    if 'price' in df_to_display.columns and df_to_display['price'].sum() > 0 : display_cols_table.insert(-1, 'price')
-    
-    final_display_cols_table = [col for col in display_cols_table if col in df_to_display.columns]
-    
-    column_configs_table = {
-        "coverImg": st.column_config.ImageColumn("Cover", width="small"), "title": st.column_config.TextColumn("Title", width="medium"),
-        "authors": st.column_config.TextColumn("Author(s)"), "series": st.column_config.TextColumn("Series", width="small"),
-        "average_rating": st.column_config.NumberColumn("Avg Rating", format="%.2f"),
-        "ratings_count": st.column_config.NumberColumn("Ratings #", format="%d"),
-        "likedPercent": st.column_config.NumberColumn("Liked", format="%d%%"),
-        "genres_display": st.column_config.TextColumn("Genres",width="small"), "bookFormat": st.column_config.TextColumn("Format",width="small"),
-        "num_pages": st.column_config.NumberColumn("Pages"), "display_publication_date": st.column_config.TextColumn("Published"),
-        "price": st.column_config.NumberColumn("Price", format="$%.2f"),
-        "Audible Link URL": st.column_config.LinkColumn("Audible", display_text="🎧", width="small")
-    }
-    active_configs_table = {k: v for k, v in column_configs_table.items() if k in final_display_cols_table}
-    st.dataframe(df_to_display[final_display_cols_table], use_container_width=True, hide_index=True, column_config=active_configs_table, height=600)
+# Add score columns if used for sorting
+if selected_sort_method == 'rating_votes_power_score':
+    display_cols.insert(display_cols.index('average_rating'), 'rating_votes_power_score')
+elif selected_sort_method == 'weighted_score':
+    display_cols.insert(display_cols.index('average_rating'), 'weighted_score')
 
-def display_image_grid(df_to_display, columns_per_row=3):
-    st.markdown("##### Image Grid View")
-    if df_to_display.empty:
-        st.info("No books to display in the grid.")
-        return
+# Add Audible link
+if 'Audible Link URL' in sorted_df.columns:
+    display_cols.append('Audible Link URL')
 
-    cols = st.columns(columns_per_row)
-    for i, row in enumerate(df_to_display.itertuples()):
-        col_index = i % columns_per_row
-        with cols[col_index]:
-            # Use markdown to structure the card with custom CSS
-            card_html = f"""
-            <div class="book-card">
-                <div class="book-card-image-container">
-                    <img src="{row.coverImg if pd.notna(row.coverImg) and row.coverImg else 'https://via.placeholder.com/150x220.png?text=No+Cover'}" alt="{row.title}">
-                </div>
-                <div class="card-title">{row.title}</div>
-                <div class="card-author">{row.authors}</div>
-                <div class="card-info"><strong>Rating:</strong> {get_star_rating(row.average_rating)}</div>
-                <div class="card-info"><strong>Genres:</strong> {row.genres_display}</div>
-                <div class="card-actions">
-            """
-            # Audible Link as a button-like link
-            if hasattr(row, 'Audible_Link_URL') and pd.notna(row.Audible_Link_URL):
-                card_html += f'<a href="{row.Audible_Link_URL}" target="_blank" class="stButton" style="text-decoration:none; display:inline-block; margin-top:5px;"><button>Listen on Audible 🎧</button></a>'
-            
-            card_html += "</div></div>"
-            st.markdown(card_html, unsafe_allow_html=True)
-            st.markdown("---") # Visual separator between cards in a column
+# Filter display_cols to only those that exist in sorted_df
+final_display_cols = [col for col in display_cols if col in sorted_df.columns]
 
 
-def display_card_view_with_popover(df_to_display, columns_per_row=3):
-    st.markdown("##### Card View with Details")
-    if df_to_display.empty:
-        st.info("No books to display as cards.")
-        return
-        
-    cols = st.columns(columns_per_row)
-    for i, row in enumerate(df_to_display.itertuples()):
-        col_index = i % columns_per_row
-        with cols[col_index]:
-            # Main card content (visible)
-            card_html_visible = f"""
-            <div class="book-card" style="margin-bottom:0;"> <div class="book-card-image-container">
-                    <img src="{row.coverImg if pd.notna(row.coverImg) and row.coverImg else 'https://via.placeholder.com/150x220.png?text=No+Cover'}" alt="{row.title}">
-                </div>
-                <div class="card-title">{row.title}</div>
-                <div class="card-author" style="margin-bottom:10px;">{row.authors}</div>
-            """
-            st.markdown(card_html_visible, unsafe_allow_html=True)
+column_configs = {
+    "coverImg": st.column_config.ImageColumn("Cover", help="Book Cover Image", width="small"),
+    "title": st.column_config.TextColumn("Title", help="Book Title", width="medium"),
+    "authors": st.column_config.TextColumn("Author(s)", width="medium"),
+    "series": st.column_config.TextColumn("Series", width="small"),
+    "average_rating": st.column_config.NumberColumn("Avg Rating", format="%.2f", help="Average user rating"),
+    "rating_votes_power_score": st.column_config.NumberColumn("Custom Score", format="%.2f"),
+    "weighted_score": st.column_config.NumberColumn("Weighted Score", format="%.2f"),
+    "ratings_count": st.column_config.NumberColumn("Ratings #", format="%d", help="Total ratings count"),
+    "likedPercent": st.column_config.NumberColumn("Liked %", format="%d%%", help="Percentage of readers who liked it"),
+    "genres_display": st.column_config.TextColumn("Genres", width="medium"),
+    "bookFormat": st.column_config.TextColumn("Format", width="small"),
+    "num_pages": st.column_config.NumberColumn("Pages", format="%d"),
+    "display_publication_date": st.column_config.TextColumn("Published", help="Primarily First Publication Date"),
+    "publisher": st.column_config.TextColumn("Publisher", width="medium"),
+    "price": st.column_config.NumberColumn("Price", format="$%.2f", help="Price if available"), # Adjust format as needed
+    "Audible Link URL": st.column_config.LinkColumn("Audible", display_text="Search 🎧", help="Search on Audible.in")
+}
 
-            # Popover for details
-            with st.popover("View Details", use_container_width=True):
-                pop_html = f"""
-                <h4>{row.title}</h4>
-                <p><strong>Author(s):</strong> {row.authors}</p>
-                <p><strong>Series:</strong> {row.series if hasattr(row, 'series') else 'N/A'}</p>
-                <p><strong>Rating:</strong> {get_star_rating(row.average_rating)} ({row.ratings_count:,} ratings)</p>
-                <p><strong>Liked:</strong> {row.likedPercent:.0f}%</p>
-                <p><strong>Genres:</strong> {getattr(row, 'genres_display', 'N/A')}</p>
-                <p><strong>Format:</strong> {row.bookFormat}</p>
-                <p><strong>Pages:</strong> {row.num_pages}</p>
-                <p><strong>Published:</strong> {row.display_publication_date}</p>
-                <p><strong>Publisher:</strong> {row.publisher}</p>
-                """
-                if 'price' in df.columns and hasattr(row, 'price') and pd.notna(row.price) and row.price > 0:
-                    pop_html += f"<p><strong>Price:</strong> ${row.price:.2f}</p>"
-                
-                st.markdown(pop_html, unsafe_allow_html=True)
-                if hasattr(row, 'Audible_Link_URL') and pd.notna(row.Audible_Link_URL):
-                    st.link_button("Listen on Audible 🎧", row.Audible_Link_URL, use_container_width=True)
-            
-            st.markdown("</div>", unsafe_allow_html=True) # Close the book-card div opened in card_html_visible
-            st.markdown("---") # Visual separator
+active_column_configs = {k: v for k, v in column_configs.items() if k in final_display_cols}
 
-# --- Main Display Logic ---
-st.subheader(f"Found {len(sorted_df)} / {len(df_original)} Books")
-if sorted_df.empty:
-    st.info("No books match your current filter scrolls. Try adjusting them, brave explorer!")
+if not sorted_df.empty:
+    st.dataframe(
+        sorted_df[final_display_cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config=active_column_configs,
+        height=600 # Set a fixed height for the dataframe viewport
+    )
 else:
-    if display_mode == "Enhanced Table":
-        display_enhanced_table(sorted_df)
-    elif display_mode == "Image Grid":
-        display_image_grid(sorted_df, columns_per_row=st.slider("Grid Columns", 2, 5, 3, key="grid_cols_slider")) # Allow user to change grid columns
-    elif display_mode == "Card View (Details on Click)":
-        display_card_view_with_popover(sorted_df, columns_per_row=st.slider("Card Columns", 2, 4, 3, key="card_cols_slider"))
-
+    st.info("No books match your current filter scrolls. Try adjusting them!")
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("Crafted with 魔法 by the Book Portal Archmage!")
+st.sidebar.info("Crafted with ✨ by the Book Wizard!")
